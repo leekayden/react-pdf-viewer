@@ -33,7 +33,10 @@ export const SvgLayer: React.FC<{
 
     useIsomorphicLayoutEffect(() => {
         const containerEle = containerRef.current;
-        if (!pdfJsApiProvider || !containerEle) {
+        // pdf.js dropped the SVG rendering backend in v4, so `SVGGraphics` is
+        // missing from modern builds. Skip the layer instead of crashing; the
+        // canvas layer is what renders the page in practice.
+        if (!pdfJsApiProvider || !containerEle || typeof pdfJsApiProvider.SVGGraphics !== 'function') {
             return;
         }
 

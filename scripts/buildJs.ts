@@ -13,18 +13,23 @@ import path from 'node:path';
 import {
     rollup,
     type OutputOptions,
+    type RollupBundleOutput,
     type RollupOptions,
-    type RollupOutput,
     type WarningHandlerWithDefault,
 } from 'rollup';
-import copy from 'rollup-plugin-copy';
-import del from 'rollup-plugin-delete';
 import esbuild from 'rollup-plugin-esbuild';
 import postcss from 'rollup-plugin-postcss';
 
-const generateTypes = (rootPackagePath: string) => {
-    exec(`tsc --project ${path.join(rootPackagePath, 'tsconfig.build.json')}`);
-};
+const generateTypes = (rootPackagePath: string) =>
+    new Promise<void>((resolve, reject) => {
+        exec(`tsc --project ${path.join(rootPackagePath, 'tsconfig.build.json')}`, (error, stdout, stderr) => {
+            if (error) {
+                reject(new Error(String(stdout || stderr || error)));
+            } else {
+                resolve();
+            }
+        });
+    });
 
 const buildPackage = async (rootPackagePath: string) => {
     const input = path.join(rootPackagePath, 'src/index.ts');
@@ -46,12 +51,30 @@ const buildPackage = async (rootPackagePath: string) => {
         warn(warning);
     };
 
+    // CSS modules are extracted by rollup-plugin-postcss as bundle assets.
+    // Grabbing them here — instead of copying files from disk afterwards —
+    // keeps the styles independent of rollup's write timing.
+    const capturedCss: Record<string, string> = {};
+    const captureCss = {
+        name: 'capture-css',
+        generateBundle(_options: unknown, bundle: RollupBundleOutput) {
+            for (const [fileName, entry] of Object.entries(bundle)) {
+                if (entry.type === 'asset' && fileName.endsWith('.css')) {
+                    capturedCss[fileName] = String(entry.source);
+                }
+            }
+        },
+    };
+
     const rollupOptions: RollupOptions[] = [
         {
             input,
             output: {
                 exports: 'named',
-                file: path.join(outputDir, `cjs/${packageName}.js`),
+                dir: path.join(outputDir, 'cjs'),
+                entryFileNames: `${packageName}.js`,
+                chunkFileNames: `${packageName}-[name].js`,
+                assetFileNames: `${packageName}.[ext]`,
                 format: 'cjs',
             },
             external,
@@ -68,26 +91,7 @@ const buildPackage = async (rootPackagePath: string) => {
                         generateScopedName: createGenerateScopedName('rpv'),
                     },
                 }),
-                copy({
-                    // Copy file synchronously, so it can be removed by using the `del` plugin
-                    copySync: true,
-                    hook: 'writeBundle',
-                    targets: [
-                        {
-                            src: path.join(outputDir, `cjs/${packageName}.css`),
-                            dest: path.join(outputDir, 'styles'),
-                        },
-                        {
-                            src: path.join(outputDir, `cjs/${packageName}.css`),
-                            dest: path.join(outputDir, 'styles'),
-                            rename: 'index.css',
-                        },
-                    ],
-                }),
-                del({
-                    hook: 'writeBundle',
-                    targets: path.join(outputDir, `cjs/${packageName}.css`),
-                }),
+                captureCss,
             ],
             onwarn: handleOnWarn,
         },
@@ -95,7 +99,10 @@ const buildPackage = async (rootPackagePath: string) => {
             input,
             output: {
                 exports: 'named',
-                file: path.join(outputDir, `cjs/${packageName}.min.js`),
+                dir: path.join(outputDir, 'cjs'),
+                entryFileNames: `${packageName}.min.js`,
+                chunkFileNames: `${packageName}-[name].min.js`,
+                assetFileNames: `${packageName}.min.[ext]`,
                 format: 'cjs',
             },
             external,
@@ -113,25 +120,7 @@ const buildPackage = async (rootPackagePath: string) => {
                         generateScopedName: createGenerateScopedName('rpv'),
                     },
                 }),
-                copy({
-                    copySync: true,
-                    hook: 'writeBundle',
-                    targets: [
-                        {
-                            src: path.join(outputDir, `cjs/${packageName}.min.css`),
-                            dest: path.join(outputDir, 'styles'),
-                        },
-                        {
-                            src: path.join(outputDir, `cjs/${packageName}.min.css`),
-                            dest: path.join(outputDir, 'styles'),
-                            rename: 'index.min.css',
-                        },
-                    ],
-                }),
-                del({
-                    hook: 'writeBundle',
-                    targets: path.join(outputDir, `cjs/${packageName}.min.css`),
-                }),
+                captureCss,
                 terser(),
             ],
             onwarn: handleOnWarn,
@@ -141,25 +130,64 @@ const buildPackage = async (rootPackagePath: string) => {
     // Generate Typescript definitions
     fs.rmSync(outputDir, { recursive: true, force: true });
     fs.mkdirSync(outputDir);
-    fs.copyFileSync(path.join(rootPackagePath, 'dist/index.js'), path.join(rootPackagePath, 'lib/index.js'));
-
-    generateTypes(rootPackagePath);
-
-    // Compile
-    return Promise.all(
-        rollupOptions.map((rollupOption) => {
-            new Promise<RollupOutput>((resolveBuild) => {
-                rollup(rollupOption).then((build) => {
-                    build.write(rollupOption.output as OutputOptions).then((out) => {
-                        resolveBuild(out);
-                    });
-                });
-            });
-        }),
+    // `lib/index.js` is a CJS entry shim picking the dev or minified bundle,
+    // matching the layout of the published packages. The CSS is decoupled and
+    // has to be imported explicitly from `lib/styles/index.css`.
+    fs.writeFileSync(
+        path.join(outputDir, 'index.js'),
+        [
+            `'use strict';`,
+            ``,
+            `if (process.env.NODE_ENV === 'production') {`,
+            `    module.exports = require('./cjs/${packageName}.min.js');`,
+            `} else {`,
+            `    module.exports = require('./cjs/${packageName}.js');`,
+            `}`,
+            ``,
+        ].join('\n'),
     );
+
+    await generateTypes(rootPackagePath);
+
+    // Compile sequentially — both outputs share `lib/cjs`.
+    for (const rollupOption of rollupOptions) {
+        const build = await rollup(rollupOption);
+        await build.write(rollupOption.output as OutputOptions);
+    }
+
+    // Write the extracted CSS to `lib/styles`. The dev CSS is also published
+    // as `index.css` (and the minified one as `index.min.css`), mirroring the
+    // published packages. Some packages have no styles at all.
+    const stylesDir = path.join(outputDir, 'styles');
+    fs.mkdirSync(stylesDir, { recursive: true });
+    const cssVariants: Array<[string, string[]]> = [
+        [`${packageName}.css`, [`${packageName}.css`, 'index.css']],
+        [`${packageName}.min.css`, [`${packageName}.min.css`, 'index.min.css']],
+    ];
+    let writtenStyles = 0;
+    for (const [extractedName, styleNames] of cssVariants) {
+        const css = capturedCss[extractedName];
+        if (!css) {
+            console.warn(`[buildJs] No extracted CSS asset named ${extractedName} for ${packageJson.name}`);
+            continue;
+        }
+        for (const styleName of styleNames) {
+            fs.writeFileSync(path.join(stylesDir, styleName), css);
+            writtenStyles += 1;
+        }
+    }
+    if (writtenStyles === 0) {
+        fs.rmdirSync(stylesDir);
+    }
 };
 
 (async () => {
     const rootPackagePath = process.cwd();
-    buildPackage(rootPackagePath);
+    try {
+        await buildPackage(rootPackagePath);
+        console.log(`Built ${rootPackagePath}`);
+    } catch (error) {
+        console.error(`[buildJs] Failed for ${rootPackagePath}:`, error);
+        process.exit(1);
+    }
 })();

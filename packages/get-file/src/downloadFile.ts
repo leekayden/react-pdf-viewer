@@ -33,7 +33,7 @@ const download = (url: string, saveAs: string): void => {
 };
 
 const downloadBlob = (data: Uint8Array, saveAs: string, mimeType: string): void => {
-    const blobUrl = URL.createObjectURL(new Blob([data], { type: mimeType }));
+    const blobUrl = URL.createObjectURL(new Blob([data as unknown as BlobPart], { type: mimeType }));
     download(blobUrl, saveAs);
     if (blobUrl) {
         URL.revokeObjectURL(blobUrl);

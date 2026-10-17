@@ -67,7 +67,15 @@ export declare namespace PdfJs {
         data?: FileData;
         cMapUrl?: string;
         cMapPacked?: boolean;
+        // Additional options supported by modern pdf.js builds. `FileData`
+        // can be a URL string or raw bytes (for example fetched from a blob
+        // URL), in which case ranged or streamed requests make no sense.
+        disableAutoFetch?: boolean;
+        disableRange?: boolean;
+        disableStream?: boolean;
         httpHeaders?: Record<string, string | string[]>;
+        isEvalSupported?: boolean;
+        standardFontDataUrl?: string;
         url?: string;
         withCredentials?: boolean;
         worker?: PDFWorker;
