@@ -31,6 +31,29 @@ const generateTypes = (rootPackagePath: string) =>
         });
     });
 
+// Packages that aggregate the styles of their dependencies ship a
+// `src/styles/index.css` full of relative `@import`s pointing at the built
+// CSS of sibling packages (default-layout -> toolbar -> search, ...).
+// Inline that chain so consumers get one self-contained stylesheet instead
+// of depending on their bundler to resolve cross-package @imports.
+const inlineCssImports = (cssPath: string, seen: Set<string>): string => {
+    const resolved = fs.realpathSync(cssPath);
+    if (seen.has(resolved)) {
+        return '';
+    }
+    seen.add(resolved);
+    return fs
+        .readFileSync(cssPath, { encoding: 'utf8' })
+        .replace(/@import\s+['"]([^'"]+)['"]\s*;/g, (_match, target: string) => {
+            const importPath = path.resolve(path.dirname(cssPath), target);
+            if (!fs.existsSync(importPath)) {
+                console.warn(`[buildJs] Unresolved @import ${target} in ${cssPath}`);
+                return '';
+            }
+            return inlineCssImports(importPath, seen);
+        });
+};
+
 const buildPackage = async (rootPackagePath: string) => {
     const input = path.join(rootPackagePath, 'src/index.ts');
     const packageContent = fs.readFileSync(path.join(rootPackagePath, 'package.json'), { encoding: 'utf8' });
@@ -160,6 +183,10 @@ const buildPackage = async (rootPackagePath: string) => {
     // published packages. Some packages have no styles at all.
     const stylesDir = path.join(outputDir, 'styles');
     fs.mkdirSync(stylesDir, { recursive: true });
+    const aggregateSource = path.join(rootPackagePath, 'src/styles/index.css');
+    const aggregate = fs.existsSync(aggregateSource)
+        ? inlineCssImports(aggregateSource, new Set())
+        : '';
     const cssVariants: Array<[string, string[]]> = [
         [`${packageName}.css`, [`${packageName}.css`, 'index.css']],
         [`${packageName}.min.css`, [`${packageName}.min.css`, 'index.min.css']],
@@ -167,12 +194,12 @@ const buildPackage = async (rootPackagePath: string) => {
     let writtenStyles = 0;
     for (const [extractedName, styleNames] of cssVariants) {
         const css = capturedCss[extractedName];
-        if (!css) {
+        if (!css && !aggregate) {
             console.warn(`[buildJs] No extracted CSS asset named ${extractedName} for ${packageJson.name}`);
             continue;
         }
         for (const styleName of styleNames) {
-            fs.writeFileSync(path.join(stylesDir, styleName), css);
+            fs.writeFileSync(path.join(stylesDir, styleName), (css || '') + aggregate);
             writtenStyles += 1;
         }
     }
